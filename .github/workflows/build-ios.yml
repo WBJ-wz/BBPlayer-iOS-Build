@@ -1,0 +1,200 @@
+name: Build BBPlayer unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/build-ios.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bbplayer-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      CI: '1'
+      APP_VARIANT: production
+      BBPLAYER_IOS_LITE: '1'
+      EXPO_NO_TELEMETRY: '1'
+      EXPO_NO_GIT_STATUS: '1'
+      EXPO_PRECOMPILED_FLAVOR: release
+      RCT_NEW_ARCH_ENABLED: '1'
+      COCOAPODS_DISABLE_STATS: 'true'
+      SENTRY_DISABLE_AUTO_UPLOAD: 'true'
+      LEFTHOOK: '0'
+      SOURCE_SHA: d08bf38bbfc3461842ff07270c8b6185cfefae92
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out the reviewed iOS port
+        uses: actions/checkout@v4
+        with:
+          repository: Francisewais/BBPlayer
+          ref: d08bf38bbfc3461842ff07270c8b6185cfefae92
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - name: Check the build tools and source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$RUNNER_TEMP/bbplayer-logs" "$RUNNER_TEMP/bbplayer-output"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+          node --version
+          pnpm --version
+          pod --version
+          python3 --version
+          df -h .
+
+      - name: Install the locked dependencies
+        run: pnpm install --frozen-lockfile --prod=false
+
+      - name: Prepare the iOS Lite configuration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('apps/mobile/app.config.ts')
+          text = path.read_text()
+          if text.count('export default ') != 1:
+              raise SystemExit('Unexpected app.config.ts export; review the source before building.')
+          # Native autolinking exclusions alone do not remove config-plugin output.
+          # Remove dev-client setup and wrap the final config to omit Firebase/Sentry.
+          text, count = re.subn(
+              r"\s*expoDevClient\(\{\s*launchMode: 'most-recent',\s*\}\),",
+              '', text, count=1,
+          )
+          if count != 1:
+              raise SystemExit('The expected dev-client plugin call was not found.')
+          text = text.replace('export default ', 'const iosLiteBaseConfig = ', 1)
+          text += '''
+
+          // This wrapper applies only to this disposable unsigned build checkout.
+          export default (context: ConfigContext): ExpoConfig => {
+            const result = iosLiteBaseConfig(context)
+            const omitted = new Set(['@sentry/react-native/expo', '@react-native-firebase/app'])
+            result.plugins = result.plugins?.filter((entry) => {
+              const name = typeof entry === 'string' ? entry : Array.isArray(entry) ? entry[0] : undefined
+              return typeof name !== 'string' || !omitted.has(name)
+            })
+            result.ios = { ...result.ios }
+            delete result.ios.googleServicesFile
+            result.updates = { ...result.updates, enabled: false }
+            return result
+          }
+          '''
+          path.write_text(text)
+          PY
+
+      - name: Generate the Xcode project
+        working-directory: apps/mobile
+        run: |
+          pnpm exec expo prebuild --platform ios --no-install --clean 2>&1 | tee "$RUNNER_TEMP/bbplayer-logs/prebuild.log"
+          python3 ios-lite/linux-build/patch-podfile.py \
+            ios/Podfile "$PWD/ios-lite/linux-build/autolink-filter.js"
+          # Use the PR's platform-neutral dependency filters, never its Linux shims.
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('ios/BBPlayer/AppDelegate.swift').read_text()
+          if 'FirebaseCore' in text or 'FirebaseApp.configure' in text:
+              raise SystemExit('Firebase unexpectedly remained in the generated AppDelegate.')
+          PY
+          printf 'export NODE_BINARY="%s"\n' "$(command -v node)" > ios/.xcode.env.local
+
+      - name: Install native dependencies
+        working-directory: apps/mobile/ios
+        run: |
+          for attempt in 1 2 3; do
+            if pod install 2>&1 | tee "$RUNNER_TEMP/bbplayer-logs/pod-install.log"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+          cp Podfile.lock "$RUNNER_TEMP/bbplayer-output/Podfile.lock"
+
+      - name: Build an unsigned arm64 Release app
+        working-directory: apps/mobile
+        env:
+          NODE_ENV: production
+        run: |
+          xcodebuild \
+            -workspace ios/BBPlayer.xcworkspace \
+            -scheme BBPlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/BBPlayer.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/BBPlayerDerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/bbplayer-logs/BBPlayer.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            archive 2>&1 | tee "$RUNNER_TEMP/bbplayer-logs/xcodebuild.log"
+
+      - name: Verify and package the IPA
+        run: |
+          APP="$RUNNER_TEMP/BBPlayer.xcarchive/Products/Applications/BBPlayer.app"
+          test -d "$APP"
+          test -s "$APP/BBPlayer"
+          test -s "$APP/main.jsbundle"
+          test ! -e "$APP/embedded.mobileprovision"
+          xcrun lipo -verify_arch arm64 "$APP/BBPlayer"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          mkdir -p "$RUNNER_TEMP/bbplayer-package/Payload"
+          ditto "$APP" "$RUNNER_TEMP/bbplayer-package/Payload/BBPlayer.app"
+          cd "$RUNNER_TEMP/bbplayer-package"
+          zip -qry "$RUNNER_TEMP/bbplayer-output/BBPlayer-iOS-unsigned.ipa" Payload
+          unzip -t "$RUNNER_TEMP/bbplayer-output/BBPlayer-iOS-unsigned.ipa" | tail -n 1
+          cd "$RUNNER_TEMP/bbplayer-output"
+          shasum -a 256 BBPlayer-iOS-unsigned.ipa > SHA256SUMS.txt
+          printf 'Source: https://github.com/Francisewais/BBPlayer/commit/%s\n' "$SOURCE_SHA" > BUILD-INFO.txt
+          printf 'Variant: iOS Lite, Release, arm64, unsigned\n' >> BUILD-INFO.txt
+          printf 'Run: https://github.com/%s/actions/runs/%s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> BUILD-INFO.txt
+          xcodebuild -version >> BUILD-INFO.txt
+          printf '\n### Unsigned IPA built\n\nSource: `%s`\n\nDownload **BBPlayer-iOS-unsigned** below. The IPA has no Apple signing identity or provisioning profile.\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BBPlayer-iOS-unsigned
+          path: ${{ runner.temp }}/bbplayer-output/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BBPlayer-iOS-build-logs
+          path: ${{ runner.temp }}/bbplayer-logs/
+          if-no-files-found: ignore
+          retention-days: 7
